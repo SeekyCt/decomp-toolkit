@@ -13,11 +13,11 @@ use object::{
     SectionKind, SymbolFlags, SymbolIndex, SymbolKind, SymbolScope, SymbolSection, elf,
     write::{Mangling, SectionId, SymbolId},
 };
+use sha1::{Digest, Sha1};
 use typed_path::Utf8NativePathBuf;
 
 use crate::{
-    obj::ObjKind,
-    util::{
+    analysis::tracker::Tracker, obj::{ObjKind, ObjRelocKind, ObjSymbolKind}, util::{
         IntoCow, ToCow,
         asm::write_asm,
         comment::{CommentSym, MWComment},
@@ -46,6 +46,7 @@ enum SubCommand {
     Disasm(DisasmArgs),
     Fixup(FixupArgs),
     Signatures(SignaturesArgs),
+    Hashes(HashesArgs),
     Info(InfoArgs),
 }
 
@@ -101,6 +102,15 @@ pub struct SignaturesArgs {
 }
 
 #[derive(FromArgs, PartialEq, Eq, Debug)]
+/// Builds function hashes from an ELF file.
+#[argp(subcommand, name = "hashes")]
+pub struct HashesArgs {
+    #[argp(positional, from_str_fn(native_path))]
+    /// input file
+    input: Utf8NativePathBuf,
+}
+
+#[derive(FromArgs, PartialEq, Eq, Debug)]
 /// Prints information about an ELF file.
 #[argp(subcommand, name = "info")]
 pub struct InfoArgs {
@@ -115,6 +125,7 @@ pub fn run(args: Args) -> Result<()> {
         SubCommand::Disasm(c_args) => disasm(c_args),
         SubCommand::Fixup(c_args) => fixup(c_args),
         SubCommand::Signatures(c_args) => signatures(c_args),
+        SubCommand::Hashes(c_args) => hashes(c_args),
         SubCommand::Info(c_args) => info(c_args),
     }
 }
@@ -418,6 +429,102 @@ fn signatures(args: SignaturesArgs) -> Result<()> {
     let mut out = buf_writer(&args.out_file)?;
     serde_yaml::to_writer(&mut out, &signatures)?;
     out.flush()?;
+    Ok(())
+}
+
+fn hashes(args: HashesArgs) -> Result<()> {
+    let mut obj = process_elf(&args.input)?;
+    if obj.kind == ObjKind::Executable
+        && (obj.sda2_base.is_none()
+            || obj.sda_base.is_none()
+            || obj.stack_address.is_none()
+            || obj.stack_end.is_none()
+            || obj.db_stack_addr.is_none())
+    {
+        log::warn!(
+            "Failed to locate all abs symbols {:#010X?} {:#010X?} {:#010X?} {:#010X?} {:#010X?} {:#010X?} {:#010X?}",
+            obj.sda2_base,
+            obj.sda_base,
+            obj.stack_address,
+            obj.stack_end,
+            obj.db_stack_addr,
+            obj.arena_hi,
+            obj.arena_lo
+        );
+        return Ok(());
+    }
+    let mut tracker = Tracker::new(&obj);
+    tracker.process(&obj)?;
+    tracker.apply(&mut obj, false)?;
+
+    let mut functions: Vec<_> = obj.symbols.by_kind(ObjSymbolKind::Function).collect();
+    functions.sort_by_key(|(_, f)| f.address);
+
+    println!("addr,hash,size");
+    for (_, symbol) in functions {
+        let section_idx = symbol.section.unwrap();
+        let section = &obj.sections[section_idx];
+        let mut instructions = section.data[(symbol.address - section.address) as usize
+            ..(symbol.address - section.address + symbol.size) as usize]
+            .chunks_exact(4)
+            .map(|c| (u32::from_be_bytes(c.try_into().unwrap()), !0u32))
+            .collect::<Vec<(u32, u32)>>();
+        for (idx, (ins, pat)) in instructions.iter_mut().enumerate() {
+            let addr = (symbol.address as usize + idx * 4) as u32;
+            if let Some(reloc) = section.relocations.at(addr) {
+                match reloc.kind {
+                    ObjRelocKind::Absolute => {
+                        *ins = 0;
+                        *pat = 0;
+                    }
+                    ObjRelocKind::PpcAddr16Hi
+                    | ObjRelocKind::PpcAddr16Ha
+                    | ObjRelocKind::PpcAddr16Lo => {
+                        *ins &= !0xFFFF;
+                        *pat = !0xFFFF;
+                    }
+                    ObjRelocKind::PpcRel24 => {
+                        *ins &= !0x3FFFFFC;
+                        *pat = !0x3FFFFFC;
+                    }
+                    ObjRelocKind::PpcRel14 => {
+                        *ins &= !0xFFFC;
+                        *pat = !0xFFFC;
+                    }
+                    ObjRelocKind::PpcEmbSda21 => {
+                        *ins &= !0x1FFFFF;
+                        *pat = !0x1FFFFF;
+                    }
+                }
+            }
+        }
+
+        let mut data = vec![0u8; instructions.len() * 8];
+        for (idx, &(ins, pat)) in instructions.iter().enumerate() {
+            data[idx * 8..idx * 8 + 4].copy_from_slice(&ins.to_be_bytes());
+            data[idx * 8 + 4..idx * 8 + 8].copy_from_slice(&pat.to_be_bytes());
+        }
+
+        let mut hasher = Sha1::new();
+        hasher.update(&data);
+        let hash = hasher.finalize();
+        let mut hash_buf = [0u8; 40];
+        let hash_str = base16ct::lower::encode_str(&hash, &mut hash_buf)
+            .map_err(|e| anyhow!("Failed to encode hash: {e}"))?;
+
+        let size_str = if symbol.size_known {
+            format!("{:#X}", symbol.size).into_cow()
+        } else if symbol.section.is_none() {
+            "ABS".to_cow()
+        } else {
+            "?".to_cow()
+        };
+
+        println!(
+            "{: <#10X},{},{}",
+            symbol.address, hash_str, size_str
+        );
+    }
     Ok(())
 }
 
